@@ -70,7 +70,6 @@
 #include <net/dlil.h>
 #include <net/ethernet.h>
 #include <net/netisr.h>
-#include <net/ppp_defs.h>
 #include <netinet/in_systm.h>
 #include <netinet/in.h>
 #include <netinet/in_var.h>
@@ -146,7 +145,7 @@ int check_icmp(struct icmp *);
 int not4us(struct ip *, struct ifnet *);
 int validate_addrs(struct BlueFilter *, struct blueCtlBlock *);
 void sip_fragtimer(void *);
-int find_ip_dest(struct mbuf**, int, struct blueCtlBlock*, struct ifnet**);
+int find_ip_dest(struct mbuf**, int, struct blueCtlBlock*, struct ifnet*);
 int lookup_frag(struct ip*, struct blueCtlBlock *ifb);
 void handle_first_frag(struct ip* ip, int inOwner, struct blueCtlBlock *ifb);
 void hold_frag(struct mbuf* m, int headerSize, struct blueCtlBlock *ifb);
@@ -204,7 +203,7 @@ enable_ipv4(struct BlueFilter *bf, void *data, struct blueCtlBlock *ifb)
         }
     } else
         return(-EOPNOTSUPP);
-    ifp = ((struct ndrv_cb *)ifb->ifb_so->so_pcb)->nd_if;
+    ifp = ndrv_get_ifp(ifb->ifb_so->so_pcb);
     ifa = ifp->if_addrhead.tqh_first;
     while (ifa) {
         if ((sd = (struct sockaddr_dl *)ifa->ifa_addr)
@@ -272,7 +271,7 @@ int  ipv4_ppp_infltr(caddr_t cookie,
     if (ifb->filter[BFS_IP].BF_flags) {
         
         /* Get the destination of the IP packet. */
-        int destination = find_ip_dest(m_orig, IPSRC_INTERFACE, ifb, ifnet_ptr);
+        int destination = find_ip_dest(m_orig, IPSRC_INTERFACE, ifb, *ifnet_ptr);
         if (destination < 0) {
             /* Handle the errror */
             if (destination == IPDEST_FRAGERR) {
@@ -330,7 +329,7 @@ ipv4_ppp_outfltr(caddr_t cookie,
         struct mbuf* m0 = NULL;
         
         /* Find the destination for this IP packet */
-        int destination = find_ip_dest(m_orig, IPSRC_X, ifb, ifnet_ptr);
+        int destination = find_ip_dest(m_orig, IPSRC_X, ifb, *ifnet_ptr);
         
         if (destination < 0) {
             if (destination == IPDEST_FRAGERR) {
@@ -386,6 +385,7 @@ int  ipv4_eth_infltr(caddr_t cookie,
 		 struct ifnet  **ifnet_ptr)
 {
     struct blueCtlBlock *ifb = (struct blueCtlBlock *)cookie;
+	int	headerLength = (*ifnet_ptr)->if_hdrlen;
     
     if (ifb->filter[BFS_IP].BF_flags) {
         struct ether_header* header = (struct ether_header *)*etherheader;
@@ -398,18 +398,27 @@ int  ipv4_eth_infltr(caddr_t cookie,
             /* Get the ARP header, only ethernet arp replies should go to both. */
             if (do_pullup(m_orig, sizeof(struct arphdr)) == 0) {
                 ah = mtod(*m_orig, struct arphdr*);
+                if (do_pullup(m_orig, sizeof(struct arphdr) + ah->ar_hln * 2 + ah->ar_pln * 2) == 0) {
+                    /* Get the source address, if it matches blue's, ignore this arp */
+                    unsigned long senderIPAddr = *(unsigned long*)(mtod(*m_orig, char*) +
+                        sizeof(struct arphdr) + ah->ar_hln);
                 if ((ah->ar_pro == ETHERTYPE_IP) &&
-                    (ah->ar_op == ARPOP_REPLY))
+                        (ah->ar_op == ARPOP_REPLY) &&
+                        (senderIPAddr != ifb->filter[BFS_IP].BF_address))
                     destination = IPDEST_X | IPDEST_BLUE;
                 else
                     destination = IPDEST_X;
-            } else
+                }
+                else
+                    destination = IPDEST_RUNTERR;
+            }
+            else
                 destination = IPDEST_RUNTERR;
         } else if (header->ether_type == ETHERTYPE_IP) {
             if (**etherheader & 0x01) /* Destination is multicast/broadcast */
                 destination = IPDEST_X | IPDEST_BLUE;
             else
-                destination = find_ip_dest(m_orig, IPSRC_INTERFACE, ifb, ifnet_ptr);
+                destination = find_ip_dest(m_orig, IPSRC_INTERFACE, ifb, *ifnet_ptr);
         } else
             /* If it isn't IP or arp, send it to both. */
             destination = IPDEST_X | IPDEST_BLUE;
@@ -418,8 +427,18 @@ int  ipv4_eth_infltr(caddr_t cookie,
          * Include the ethernet header before we send the packet to blue,
          * dupe it to be sent to blue, or hold it to be sent later.
          */
-         if (*m_orig != NULL)
-            MDATA_INCLUDE_HEADER(*m_orig, sizeof(struct ether_header));
+		if (*m_orig != NULL) {
+			if ((*m_orig)->m_data == *etherheader + headerLength) {
+				MDATA_INCLUDE_HEADER(*m_orig, headerLength);
+			} else {
+				M_PREPEND(*m_orig, headerLength, M_NOWAIT);
+				if (*m_orig != NULL) {
+					bcopy(*etherheader, (*m_orig)->m_hdr.mh_data, headerLength);
+				} else {
+					destination = IPDEST_RUNTERR;
+				}
+			}
+		}
         if (destination < 0) {
             if (destination == IPDEST_FRAGERR) {
                 /*
@@ -441,9 +460,9 @@ int  ipv4_eth_infltr(caddr_t cookie,
                 m0 = m_dup(*m_orig, M_NOWAIT);
             /* let the firewall take a crack at stuff for classic */
             if (m0 && header->ether_type == ETHERTYPE_IP) {
-                MDATA_REMOVE_HEADER(m0, sizeof(struct ether_header));
+                MDATA_REMOVE_HEADER(m0, headerLength);
                 if(process_firewall_in(&m0) == FIREWALL_ACCEPTED)
-                    MDATA_INCLUDE_HEADER(m0, sizeof(struct ether_header));
+                    MDATA_INCLUDE_HEADER(m0, headerLength);
             }
             if (m0)
                 blue_inject(ifb, m0);
@@ -451,7 +470,7 @@ int  ipv4_eth_infltr(caddr_t cookie,
         
         /* Remove the ethernet header we included above before returning. */
         if (*m_orig != NULL)
-            MDATA_REMOVE_HEADER(*m_orig, sizeof(struct ether_header));
+            m_adj(*m_orig, headerLength);
     }
     /* If we didn't consume the packet (send it to blue), return 0 */
     return *m_orig != NULL ? 0 : EJUSTRETURN;
@@ -478,7 +497,7 @@ ipv4_eth_outfltr(caddr_t cookie,
         int destination = IPDEST_UNKNOWN;
         if ((*dest)->sa_family == AF_INET) {
             /* Find the destination for the IP packet */
-            destination = find_ip_dest(m_orig, IPSRC_X, ifb, ifnet_ptr);
+            destination = find_ip_dest(m_orig, IPSRC_X, ifb, *ifnet_ptr);
         }
         if (destination < 0) {
             if (destination == IPDEST_FRAGERR) {
@@ -517,10 +536,12 @@ ipv4_eth_outfltr(caddr_t cookie,
 /*
  * Outbound IPv4 filter: Packets from X's IP stack.  This filter
  *  gets called for output via loopback.
- * We don't yet have a fully-formed packet, so we have to save
- *  the frame header if we siphon off the packet for our client.
+ * We don't yet have a fully-formed packet, so we have to make
+ *  up a frame header. Loopback doesn't set frame_type.
  * Note that loopback uses only the output filter (what's input
  *  is output, and what's output is input).
+ * In this case, this is more like an input filter, so we use
+ *  IPSRC_INTERFACE.
  */
 int
 ipv4_loop_outfltr(caddr_t cookie,
@@ -537,12 +558,12 @@ ipv4_loop_outfltr(caddr_t cookie,
         struct mbuf* m0 = NULL;
         
         if ((*dest)->sa_family == AF_INET) {
-            destination = find_ip_dest(m_orig, IPSRC_X, ifb, ifnet_ptr);
+            destination = find_ip_dest(m_orig, IPSRC_INTERFACE, ifb, *ifnet_ptr);
             if (destination < 0 && *m_orig != NULL)
-                destination = IPDEST_INTERFACE;
+                destination = IPDEST_X;
         }
         if (destination == IPDEST_UNKNOWN)
-            destination = IPDEST_INTERFACE;
+            destination = IPDEST_X;
         if (destination > 0) {
             if (destination == IPDEST_BLUE) {
                 m0 = *m_orig;
@@ -554,14 +575,15 @@ ipv4_loop_outfltr(caddr_t cookie,
                  * Send m0 to blue. We may have to prepend an ethernet header
                  * if blue is expecting it.
                  */
-                if (ifb->media_addr_size == 6) {
+                if (ifb->media_addr_size == ETHER_ADDR_LEN) {
                     struct ether_header *eh;
                     M_PREPEND(m0, sizeof(struct ether_header), M_NOWAIT);
                     if (m0 != NULL)
                     {
                         eh = mtod(m0, struct ether_header*);
-                        eh->ether_type = *(unsigned short*)frame_type;
-                        bcopy(ifb->dev_media_addr, m0->m_data, ifb->media_addr_size);
+                        eh->ether_type = ETHERTYPE_IP;
+                        bcopy(ifb->dev_media_addr, eh->ether_dhost, ETHER_ADDR_LEN);
+                        bcopy(ifb->dev_media_addr, eh->ether_shost, ETHER_ADDR_LEN);
                     }
                 }
                 if (m0)
@@ -595,14 +617,34 @@ si_send_eth_ipv4(register struct mbuf **m_orig, struct blueCtlBlock *ifb,
                 destination = IPDEST_INTERFACE;
             else if (enetHeader->ether_type == ETHERTYPE_IP) {
                 MDATA_REMOVE_HEADER(*m_orig, sizeof(struct ether_header));
-                destination = find_ip_dest(m_orig, IPSRC_BLUE, ifb,
-                                &((struct ndrv_cb *)ifb->ifb_so->so_pcb)->nd_if);
-                if (*m_orig != 0) {
+                /* Verify packet length is valid */
+                if (do_pullup(m_orig, sizeof(struct ip)) == 0)
+                    {
+                    struct ip *ipHeader = NULL;
+                    int nLength = 0;
+                    struct mbuf *m_temp = NULL;
+                    for (m_temp = *m_orig; m_temp != NULL; m_temp = m_temp->m_next)
+                        nLength += m_temp->m_len;
+                    ipHeader = mtod(*m_orig, struct ip*);
+                    if (ipHeader->ip_len != nLength)
+                        {
+                        // packet is wrong size
+                        log(LOG_WARNING, "SharedIP received truncated or oversized IP packet\n");
+                        m_freem(*m_orig);
+                        *m_orig = NULL;
+                        }
+                    else
+                        {
+                        destination = find_ip_dest(m_orig, IPSRC_BLUE, ifb,
+                                        ndrv_get_ifp(ifb->ifb_so->so_pcb));
+                        }
+                    }
+                if (*m_orig != NULL) {
                     /* Let the firewall have a crack at it. */
                     if (process_firewall_out(m_orig, ifp) != 0)
                         destination = IPDEST_FIREWALLERR;
                     else
-                MDATA_INCLUDE_HEADER(*m_orig, sizeof(struct ether_header));
+						MDATA_INCLUDE_HEADER(*m_orig, sizeof(struct ether_header));
                 }
             } else
                 destination = IPDEST_UNKNOWN;
@@ -619,7 +661,7 @@ si_send_eth_ipv4(register struct mbuf **m_orig, struct blueCtlBlock *ifb,
             if (m1 != NULL) {
                 char* pHeader = mtod(m1, char*);
                 MDATA_REMOVE_HEADER(m1, sizeof(struct ether_header));
-                m1->m_pkthdr.rcvif = ((struct ndrv_cb*)ifb->ifb_so->so_pcb)->nd_if;
+                m1->m_pkthdr.rcvif = ndrv_get_ifp(ifb->ifb_so->so_pcb);
                 dlil_inject_pr_input(m1, pHeader, ifb->ipv4_proto_filter_id);
             }
         }
@@ -644,8 +686,26 @@ si_send_ppp_ipv4(register struct mbuf **m_orig, struct blueCtlBlock *ifb,
         int destination = IPDEST_UNKNOWN;
         struct mbuf* m1 = NULL;
                 
-        destination = find_ip_dest(m_orig, IPSRC_BLUE, ifb,
-                        &((struct ndrv_cb *)ifb->ifb_so->so_pcb)->nd_if);
+        if (do_pullup(m_orig, sizeof(struct ether_header)) == 0)
+            {
+            struct ip *ipHeader = NULL;
+            int nLength = 0;
+            struct mbuf *m_temp = NULL;
+            for (m_temp = *m_orig; m_temp != NULL; m_temp = m_temp->m_next)
+                nLength += m_temp->m_len;
+            ipHeader = mtod(*m_orig, struct ip*);
+            if (ipHeader->ip_len != nLength)
+                {
+                log(LOG_WARNING, "SharedIP received truncated or oversized IP packet\n");
+                m_freem(*m_orig);
+                *m_orig = NULL;
+                }
+            else
+                {
+                destination = find_ip_dest(m_orig, IPSRC_BLUE, ifb,
+                                ndrv_get_ifp(ifb->ifb_so->so_pcb));
+                }
+            }
         if (*m_orig != NULL) {
             if(process_firewall_out(m_orig, ifp) != FIREWALL_ACCEPTED)
                 destination = IPDEST_FIREWALLERR;
@@ -659,7 +719,7 @@ si_send_ppp_ipv4(register struct mbuf **m_orig, struct blueCtlBlock *ifb,
             m1 = m_dup(*m_orig, M_NOWAIT);
         if (m1 != NULL) {
             char* pHeader = mtod(m1, char*);
-            m1->m_pkthdr.rcvif = ((struct ndrv_cb*)ifb->ifb_so->so_pcb)->nd_if;
+            m1->m_pkthdr.rcvif = ndrv_get_ifp(ifb->ifb_so->so_pcb);
             dlil_inject_pr_input(m1, pHeader, ifb->ipv4_proto_filter_id);
         }
     }
@@ -963,7 +1023,7 @@ validate_addrs(struct BlueFilter *bf, struct blueCtlBlock *ifb)
     struct ifaddr *ifa;
     struct sockaddr_in *sin;
 
-    ifp = ((struct ndrv_cb *)ifb->ifb_so->so_pcb)->nd_if;
+    ifp = ndrv_get_ifp(ifb->ifb_so->so_pcb);
     ifa = ifp->if_addrhead.tqh_first;
     while (ifa) {
         if ((sin = (struct sockaddr_in *)ifa->ifa_addr)
@@ -1078,7 +1138,7 @@ sip_fragtimer(void *arg)
  */
 int
 find_ip_dest(struct mbuf** m_orig, int inSource,
-             struct blueCtlBlock *ifb, struct ifnet **ifnet_ptr)
+             struct blueCtlBlock *ifb, struct ifnet *ifnet_ptr)
 {
     struct ip *ipHeader = NULL;
     int ipHeaderLength = 0;
@@ -1090,7 +1150,7 @@ find_ip_dest(struct mbuf** m_orig, int inSource,
         return IPDEST_RUNTERR; /* Oops, we just lost the packet */
     ipHeader = mtod(*m_orig, struct ip*);
     if (inSource != IPSRC_INTERFACE) {
-        if (not4us(ipHeader, *ifnet_ptr))
+        if (not4us(ipHeader, ifnet_ptr))
             return IPDEST_INTERFACE;
         if (IN_CLASSD(ipHeader->ip_dst.s_addr))
             return (IPDEST_X | IPDEST_BLUE | IPDEST_INTERFACE) & (~inSource);

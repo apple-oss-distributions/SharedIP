@@ -381,9 +381,7 @@ int
 si_bind(struct socket *so, struct sockaddr *nam,
 	    register struct kextcb *kp)
 {
-    register struct ndrv_cb *np = sotondrvcb(so);
     register struct blueCtlBlock *ifb;
-    register struct ifnet *ifp;
 
     if ((ifb = _MALLOC(sizeof (struct blueCtlBlock), M_PCB, M_WAITOK)) == NULL) {
 #if SIP_DEBUG_ERR
@@ -392,32 +390,13 @@ si_bind(struct socket *so, struct sockaddr *nam,
         return(ENOBUFS);
     }
     bzero(ifb, sizeof(struct blueCtlBlock));
-    np = (struct ndrv_cb *)so->so_pcb;
     TAILQ_INIT(&ifb->fraglist);	/* In case... */
-    if (np == NULL) {
+    if (so->so_pcb == NULL) {
 #if SIP_DEBUG_ERR
         log(LOG_WARNING, "si_bind: np == NULL\n");
 #endif
         if (ifb->dev_media_addr)
             FREE(ifb->dev_media_addr, M_TEMP);
-        _FREE(ifb, M_PCB);
-        return(EINVAL); /* XXX */
-    }
-    if (np->nd_signature != NDRV_SIGNATURE) {
-#if SIP_DEBUG_ERR
-        log(LOG_WARNING, "si_bind: np->signature not NDRV_SIG\n");
-#endif
-        if (ifb->dev_media_addr)
-            FREE(ifb->dev_media_addr, M_TEMP);
-        _FREE(ifb, M_PCB);
-        return(EINVAL); /* XXX */
-    }
-    if ((ifp = np->nd_if) == NULL) { /* Set by ndrv_bind() */
-#if SIP_DEBUG_ERR
-        log(LOG_WARNING, "si_bind: np->nd_if is not set\n");
-#endif
-        if (ifb->dev_media_addr)
-                FREE(ifb->dev_media_addr, M_TEMP);
         _FREE(ifb, M_PCB);
         return(EINVAL); /* XXX */
     }
@@ -456,8 +435,8 @@ si_close(struct socket *so, register struct kextcb *kp)
     s = splnet();
     if ((retval = atalk_stop((struct blueCtlBlock *)kp->e_fcb)) == 0)
     	retval = ipv4_stop((struct blueCtlBlock *)kp->e_fcb);
-    if (retval == 0) {
-        if (ifb && !ifb->fraglist_timer_on)
+    if (retval == 0 && ifb != NULL) {
+        if (!ifb->fraglist_timer_on)
             release_ifb(ifb);
         else
             ifb->ClosePending = 1;
@@ -559,7 +538,7 @@ si_send(struct socket *so, struct sockaddr **addr, struct uio **uio,
      * Check that the interface is not NULL
      */
     if (so->so_pcb != NULL)
-        ifp = (struct ifnet *)((struct ndrv_cb *)so->so_pcb)->nd_if;
+        ifp = ndrv_get_ifp(so->so_pcb);
     else
         ifp = NULL;
     if (ifp == NULL)
@@ -572,39 +551,32 @@ si_send(struct socket *so, struct sockaddr **addr, struct uio **uio,
     /*
      * Don't need to pull-up since we get "one-buffer" packets from
      *  PF_NDRV output.
-     *
-     * That's not right, as the assert below will show.
      */
-#if SIP_DEBUG
-    if ((*top)->m_len < (*top)->m_pkthdr.len)
-        log(LOG_WARNING, "si_send: mbuf doesn't contain full packet, missing %d bytes",
-            (*top)->m_pkthdr.len - (*top)->m_len);
-#endif
     p = mtod(*top, unsigned char *);/* Point to destination media addr */
     x = splnet();
     retval = 0;
     if (ifp->if_type == IFT_ETHER) {
-        s = (unsigned short *)(p+(ifb->media_addr_size));
-        if ((*top)->m_len >= 16 + ifb->media_addr_size)
+        if ((*top)->m_len >= 22)
+        {
+            u_int16_t	eType = ntohs(*(u_int16_t*)&p[12]);
             /* These checks are only determing if the packet is 802.3 with a SNAP protocol
              * or Ethernet Type 2. The assumption is that all IP packets will be EType2
              * and all AppleTalk packetes will be 802.3
-             *
-             * In the case of gigabit w/ jumbo frames, all protocols will need to be
-             * 802.3, I think.
              */
-            if (s[6] <= ETHERMTU && s[7] == 0xaaaa)	/* Could be Atalk */
-                /* 802.3 && SNAP */
+            if (eType <= ETHERMTU &&
+                *(u_int16_t*)&p[14] == 0xaaaa &&
+                p[16] == 0x03) /* SNAP */
                 retval = si_send_eth_atalk(top, ifb);
-            else if (s[6] >= ETHERMTU)		/* Could be IPv4 */
-                /* EType2 (not 802.3) */
+            else if (eType == ETHERTYPE_IP ||
+                     eType == ETHERTYPE_ARP) /* Is IP or ARP */
                 retval = si_send_eth_ipv4(top, ifb, ifp);
             else
-                /* 802.3, not SNAP */
+                /* Not SNAP, not IP */
                 retval = 0;
+        }
         else {
 #if SIP_DEBUG_ERR
-            log(LOG_WARNING, "si_send: mbuf contains less than 16 bytes, can't determine protocol!");
+            log(LOG_WARNING, "si_send: mbuf contains less than 22 bytes, can't determine protocol!");
 #endif
         }
     } else if (ifp->if_type == IFT_PPP) {
@@ -798,10 +770,28 @@ my_frameout(struct mbuf **m0,
     }
     *m0 = m;
     eh = mtod(m, struct ether_header *);
-    (void)memcpy(&eh->ether_type, ether_type,
-            sizeof(eh->ether_type));
-    (void)memcpy(eh->ether_dhost, dest_linkaddr, 6);
-    (void)memcpy(eh->ether_shost, ac->ac_enaddr,
+    if (ether_type != NULL)
+    {
+        memcpy(&eh->ether_type, ether_type,
+                sizeof(eh->ether_type));
+    }
+    else
+    {
+        // 802.3, eh->ether_type should be set to
+        // the length of the packet
+        u_int16_t	length = 0;
+        struct mbuf* cur = *m0;
+        while (cur != NULL)
+        {
+            length += cur->m_hdr.mh_len;
+            cur = cur->m_hdr.mh_next;
+        }
+        length -= sizeof(struct ether_header);
+        
+        eh->ether_type = htons(length);
+    }
+    memcpy(eh->ether_dhost, dest_linkaddr, 6);
+    memcpy(eh->ether_shost, ac->ac_enaddr,
         sizeof(eh->ether_shost));
     m->m_flags |= 0x10;
     *m0 = m;
